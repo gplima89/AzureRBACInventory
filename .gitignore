@@ -1,0 +1,10 @@
+# Generated reports
+*.xlsx
+*.csv
+
+# PowerShell
+*.ps1xml
+
+# OS
+Thumbs.db
+.DS_Store
