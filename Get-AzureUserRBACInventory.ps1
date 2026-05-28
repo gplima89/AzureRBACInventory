@@ -217,7 +217,7 @@ function Resolve-Scope {
 
 # --- Collect role definitions ------------------------------------------------
 Write-Host 'Collecting role definitions...' -ForegroundColor Cyan
-$roleDefs = Get-AzRoleDefinition | Sort-Object Name
+$roleDefs = Get-AzRoleDefinition -WarningAction SilentlyContinue | Sort-Object Name
 $roleDefRows = $roleDefs | ForEach-Object {
     [pscustomobject]@{
         RoleName       = $_.Name
@@ -236,8 +236,12 @@ $explicitScopeProvided = ($ManagementGroupIds -and $ManagementGroupIds.Count -gt
                          $ScanAllManagementGroups
 
 if (-not $explicitScopeProvided) {
-    Write-Host 'No scope parameters specified — defaulting to all enabled subscriptions.' -ForegroundColor Yellow
-    $SubscriptionIds = (Get-AzSubscription | Where-Object { $_.State -eq 'Enabled' }).Id
+    Write-Host 'No scope parameters specified — defaulting to all enabled subscriptions in the current tenant.' -ForegroundColor Yellow
+    # Scope to the current tenant to avoid MFA / conditional-access warnings from
+    # guest tenants we have no intention of scanning. WarningAction SilentlyContinue
+    # suppresses the per-tenant "Unable to acquire token" noise from Az.Accounts.
+    $SubscriptionIds = (Get-AzSubscription -TenantId $ctx.Tenant.Id -WarningAction SilentlyContinue |
+                        Where-Object { $_.State -eq 'Enabled' }).Id
 }
 
 # Build list of (Label, Scope) tuples to query Get-AzRoleAssignment with.
@@ -253,7 +257,7 @@ foreach ($mgId in ($ManagementGroupIds | Where-Object { $_ })) {
 
 if ($ScanAllManagementGroups) {
     try {
-        $mgs = Get-AzManagementGroup -ErrorAction Stop
+        $mgs = Get-AzManagementGroup -WarningAction SilentlyContinue -ErrorAction Stop
         foreach ($mg in $mgs) {
             if ($ManagementGroupIds -and ($ManagementGroupIds -contains $mg.Name)) { continue }
             $scopeQueries.Add([pscustomobject]@{
@@ -299,26 +303,39 @@ foreach ($rg in ($ResourceGroupScopes | Where-Object { $_ })) {
 $allAssignments = New-Object System.Collections.Generic.List[object]
 $seen = New-Object 'System.Collections.Generic.HashSet[string]'
 
-foreach ($q in $scopeQueries) {
-    try {
-        if ($q.SetContextSub) {
-            Set-AzContext -SubscriptionId $q.SetContextSub -ErrorAction Stop | Out-Null
-        }
-        Write-Host ("Scanning {0}" -f $q.Label) -ForegroundColor Cyan
-        $assignments = Get-AzRoleAssignment -Scope $q.Scope -ErrorAction Stop
-        foreach ($a in $assignments) {
-            if ($a.ObjectType -ne 'User') { continue }
-            $key = "$($a.RoleAssignmentId)"
-            if ([string]::IsNullOrEmpty($key)) {
-                $key = "$($a.Scope)|$($a.RoleDefinitionId)|$($a.ObjectId)"
+# Az.Accounts emits "Unable to acquire token for tenant ''" warnings whenever it
+# silently probes guest tenants we don't care about. Suppress them only inside
+# this loop so we still see warnings from our own Write-Warning calls.
+$savedWarningPref = $WarningPreference
+$WarningPreference = 'SilentlyContinue'
+try {
+    foreach ($q in $scopeQueries) {
+        try {
+            if ($q.SetContextSub) {
+                Set-AzContext -SubscriptionId $q.SetContextSub -TenantId $ctx.Tenant.Id -ErrorAction Stop -WarningAction SilentlyContinue | Out-Null
             }
-            if ($seen.Add($key)) {
-                $allAssignments.Add($a) | Out-Null
+            $WarningPreference = $savedWarningPref
+            Write-Host ("Scanning {0}" -f $q.Label) -ForegroundColor Cyan
+            $WarningPreference = 'SilentlyContinue'
+            $assignments = Get-AzRoleAssignment -Scope $q.Scope -ErrorAction Stop -WarningAction SilentlyContinue
+            foreach ($a in $assignments) {
+                if ($a.ObjectType -ne 'User') { continue }
+                $key = "$($a.RoleAssignmentId)"
+                if ([string]::IsNullOrEmpty($key)) {
+                    $key = "$($a.Scope)|$($a.RoleDefinitionId)|$($a.ObjectId)"
+                }
+                if ($seen.Add($key)) {
+                    $allAssignments.Add($a) | Out-Null
+                }
             }
+        } catch {
+            $WarningPreference = $savedWarningPref
+            Write-Warning ("Failed to scan {0}: {1}" -f $q.Label, $_.Exception.Message)
+            $WarningPreference = 'SilentlyContinue'
         }
-    } catch {
-        Write-Warning ("Failed to scan {0}: {1}" -f $q.Label, $_.Exception.Message)
     }
+} finally {
+    $WarningPreference = $savedWarningPref
 }
 
 # --- Role name filter (supports wildcards) ----------------------------------
